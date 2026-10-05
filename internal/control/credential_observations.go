@@ -59,6 +59,7 @@ type ObservationQuotaWindow struct {
 	ModelIDs      []string                `json:"model_ids,omitempty"`
 	State         string                  `json:"state"`
 	IsPrimary     bool                    `json:"is_primary,omitempty"`
+	ObservedAtMS  *int64                  `json:"observed_at_ms,omitempty"`
 	ObservedUsage *ObservationWindowUsage `json:"observed_usage,omitempty"`
 }
 
@@ -387,6 +388,11 @@ func (s *Service) refreshCredentialObservationOnce(
 				}
 			}
 		}
+		// 服务端 completedMS 覆盖新实测样本，不信 provider 注入的 observed_at_ms
+		for i := range snapshot.QuotaWindows {
+			clonedMS := completedMS
+			snapshot.QuotaWindows[i].ObservedAtMS = &clonedMS
+		}
 		switch {
 		case len(observation.ObservedQuotaScopes) > 0:
 			currentQuotaData := observation.QuotaObserved || len(snapshot.QuotaWindows) > 0
@@ -427,6 +433,11 @@ func (s *Service) refreshCredentialObservationOnce(
 		if err != nil {
 			return CredentialObservationResponse{}, app_errors.ErrInternalServer
 		}
+		// The observation time is when this result was actually obtained, not when
+		// the attempt started: a slow refresh would otherwise be stamped older
+		// than passive samples captured while it was still in flight, letting them
+		// overwrite it. Keeping updated_at_ms on the same instant also guarantees
+		// the passive writer's compare-and-set token changes on every active write.
 		row := models.CredentialObservation{
 			CredentialID: credential.ID, IdentityFingerprint: credential.IdentityFingerprint,
 			SchemaVersion: 1, ObservationVersion: version, SnapshotJSON: models.JSON(encoded),
@@ -438,7 +449,12 @@ func (s *Service) refreshCredentialObservationOnce(
 			return CredentialObservationResponse{}, err
 		}
 		response := mapCredentialObservation(row)
-		s.applyCredentialQuotaObservation(credentialID, &response)
+		ref, ok := s.registry.CredentialRef(credentialID)
+		var identityGen uint64
+		if ok {
+			identityGen = ref.IdentityGeneration
+		}
+		s.applyCredentialQuotaObservation(credentialID, identityGen, &response)
 		if mode != observationRefreshAfterReset && previousQuotaFresh &&
 			previous.IdentityFingerprint == credential.IdentityFingerprint &&
 			providerobservation.QuotaRecovered(providerQuotaWindows(previousSnapshot.QuotaWindows), freshWindows) {
@@ -566,44 +582,84 @@ func (s *Service) recordCredentialObservationFailure(
 	summary string,
 	authRefreshSecretVersion *uint64,
 ) (CredentialObservationResponse, error) {
-	failed := previous
-	failed.CredentialID = credential.ID
-	failed.IdentityFingerprint = credential.IdentityFingerprint
-	failed.SchemaVersion = 1
-	if failed.ObservationVersion == 0 {
-		failed.ObservationVersion = 1
+	var response CredentialObservationResponse
+	mutateErr := s.withCredentialMutation(credential.ID, func() error {
+		var current models.CredentialObservation
+		hasCurrent := false
+		if err := s.db.WithContext(ctx).Take(&current, "credential_id = ?", credential.ID).Error; err != nil {
+			if !errors.Is(err, gorm.ErrRecordNotFound) {
+				return app_errors.ParseDBError(err)
+			}
+		} else {
+			hasCurrent = true
+		}
+
+		// failure 应以同身份 current 完整行作基线：
+		// 1. 若 DB 存在同身份 current 行，以 current 为基线（防止把 current stale/error 通过 previous fresh 重新变 fresh）；
+		// 2. 若无 current 行但 previous 为同身份，以 previous 为基线；
+		// 3. 否则创建新基线。
+		var baseline models.CredentialObservation
+		switch {
+		case hasCurrent && current.IdentityFingerprint == credential.IdentityFingerprint:
+			baseline = current
+		case !hasCurrent && previous.IdentityFingerprint == credential.IdentityFingerprint:
+			baseline = previous
+		default:
+			baseline = models.CredentialObservation{
+				CredentialID:        credential.ID,
+				IdentityFingerprint: credential.IdentityFingerprint,
+				State:               models.CredentialObservationError,
+			}
+		}
+
+		failed := baseline
+		failed.CredentialID = credential.ID
+		failed.IdentityFingerprint = credential.IdentityFingerprint
+		failed.SchemaVersion = 1
+		if failed.ObservationVersion == 0 {
+			failed.ObservationVersion = 1
+		}
+		if failed.State != models.CredentialObservationFresh {
+			failed.State = models.CredentialObservationError
+		}
+		failed.LastAttemptAtMS = &attemptMS
+		failed.NextAllowedAtMS = nil
+		failed.LastErrorCode = code
+		failed.UpdatedAtMS = attemptMS
+		if authRefreshSecretVersion != nil {
+			value := *authRefreshSecretVersion
+			failed.LastAuthRefreshSecretVersion = &value
+		}
+		if len(failed.SnapshotJSON) == 0 {
+			failed.SnapshotJSON = models.JSON(`{}`)
+		}
+		updates := map[string]any{
+			"identity_fingerprint": failed.IdentityFingerprint,
+			"schema_version":       failed.SchemaVersion,
+			"state":                failed.State,
+			"last_attempt_at_ms":   failed.LastAttemptAtMS,
+			"next_allowed_at_ms":   failed.NextAllowedAtMS,
+			"last_error_code":      failed.LastErrorCode,
+			"updated_at_ms":        failed.UpdatedAtMS,
+		}
+		if authRefreshSecretVersion != nil {
+			updates["last_auth_refresh_secret_version"] = failed.LastAuthRefreshSecretVersion
+		}
+		if err := s.upsertCredentialObservationMetadataOnly(ctx, credential.ID, failed, updates); err != nil {
+			return err
+		}
+		response = mapCredentialObservation(failed)
+		ref, ok := s.registry.CredentialRef(credential.ID)
+		var identityGen uint64
+		if ok {
+			identityGen = ref.IdentityGeneration
+		}
+		s.applyCredentialQuotaObservation(credential.ID, identityGen, &response)
+		return nil
+	})
+	if mutateErr != nil {
+		return CredentialObservationResponse{}, mutateErr
 	}
-	if failed.State != models.CredentialObservationFresh {
-		failed.State = models.CredentialObservationError
-	}
-	failed.LastAttemptAtMS = &attemptMS
-	failed.NextAllowedAtMS = nil
-	failed.LastErrorCode = code
-	failed.UpdatedAtMS = attemptMS
-	if authRefreshSecretVersion != nil {
-		value := *authRefreshSecretVersion
-		failed.LastAuthRefreshSecretVersion = &value
-	}
-	if len(failed.SnapshotJSON) == 0 {
-		failed.SnapshotJSON = models.JSON(`{}`)
-	}
-	updates := map[string]any{
-		"identity_fingerprint": failed.IdentityFingerprint,
-		"schema_version":       failed.SchemaVersion,
-		"state":                failed.State,
-		"last_attempt_at_ms":   failed.LastAttemptAtMS,
-		"next_allowed_at_ms":   failed.NextAllowedAtMS,
-		"last_error_code":      failed.LastErrorCode,
-		"updated_at_ms":        failed.UpdatedAtMS,
-	}
-	if authRefreshSecretVersion != nil {
-		updates["last_auth_refresh_secret_version"] = failed.LastAuthRefreshSecretVersion
-	}
-	if err := s.upsertCredentialObservationMetadataOnly(ctx, credential.ID, failed, updates); err != nil {
-		return CredentialObservationResponse{}, err
-	}
-	response := mapCredentialObservation(failed)
-	s.applyCredentialQuotaObservation(credential.ID, &response)
 	return response, fmt.Errorf("%s: %w", summary, app_errors.ErrBadGateway)
 }
 
@@ -712,35 +768,59 @@ func (s *Service) upsertCredentialObservationMetadataOnly(
 }
 
 func (s *Service) restoreCredentialQuotaObservations(ctx context.Context) error {
+	return s.restoreCredentialQuotaObservationsInternal(ctx, false)
+}
+
+// restoreCredentialQuotaObservationsHoldingMutations 在调用方已经持有凭据 mutation
+// stripes 时恢复配额观测，直接执行读取与发布，避免同 stripe 非重入死锁。
+func (s *Service) restoreCredentialQuotaObservationsHoldingMutations(ctx context.Context) error {
+	return s.restoreCredentialQuotaObservationsInternal(ctx, true)
+}
+
+func (s *Service) restoreCredentialQuotaObservationsInternal(ctx context.Context, holdingMutations bool) error {
 	var observations []models.CredentialObservation
-	if err := s.db.WithContext(ctx).Find(&observations).Error; err != nil {
+	if err := s.db.WithContext(ctx).Select("credential_id").Order("credential_id ASC").Find(&observations).Error; err != nil {
 		return app_errors.ParseDBError(err)
 	}
-	if len(observations) == 0 {
-		return nil
-	}
-	credentialIDs := make([]uint, 0, len(observations))
 	for _, observation := range observations {
-		credentialIDs = append(credentialIDs, observation.CredentialID)
-	}
-	var credentials []models.Credential
-	if err := s.db.WithContext(ctx).
-		Where("id IN ?", credentialIDs).
-		Find(&credentials).Error; err != nil {
-		return app_errors.ParseDBError(err)
-	}
-	identities := make(map[uint]string, len(credentials))
-	for _, credential := range credentials {
-		identities[credential.ID] = credential.IdentityFingerprint
-	}
-	for _, observation := range observations {
-		identity, exists := identities[observation.CredentialID]
-		if !exists {
+		if holdingMutations {
+			if err := s.restoreSingleCredentialQuotaObservation(ctx, observation.CredentialID); err != nil {
+				return err
+			}
 			continue
 		}
-		response := presentCredentialObservation(observation, identity)
-		s.applyCredentialQuotaObservation(observation.CredentialID, response)
+		// 恢复也在凭据更新锁内读取并发布，避免覆盖期间的被动观测。
+		err := s.withCredentialMutation(observation.CredentialID, func() error {
+			return s.restoreSingleCredentialQuotaObservation(ctx, observation.CredentialID)
+		})
+		if err != nil {
+			return err
+		}
 	}
+	return nil
+}
+
+func (s *Service) restoreSingleCredentialQuotaObservation(ctx context.Context, credentialID uint) error {
+	ref, ok := s.registry.CredentialRef(credentialID)
+	if !ok {
+		return nil
+	}
+	var credential models.Credential
+	if err := s.db.WithContext(ctx).Take(&credential, ref.ID).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil
+		}
+		return app_errors.ParseDBError(err)
+	}
+	var current models.CredentialObservation
+	if err := s.db.WithContext(ctx).Take(&current, "credential_id = ?", ref.ID).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil
+		}
+		return app_errors.ParseDBError(err)
+	}
+	response := presentCredentialObservation(current, credential.IdentityFingerprint)
+	s.applyCredentialQuotaObservation(ref.ID, ref.IdentityGeneration, response)
 	return nil
 }
 
@@ -777,17 +857,18 @@ func observationResponseValue(value *CredentialObservationResponse) CredentialOb
 
 func (s *Service) applyCredentialQuotaObservation(
 	credentialID uint,
+	identityGeneration uint64,
 	response *CredentialObservationResponse,
 ) {
 	if s == nil || s.registry == nil || credentialID == 0 || response == nil ||
 		response.State != string(models.CredentialObservationFresh) ||
 		response.Snapshot == nil {
 		if s != nil && s.registry != nil && credentialID != 0 {
-			s.registry.SetCredentialQuotaObservation(credentialID, nil, time.Time{})
+			s.registry.ApplyQuotaWindows(credentialID, identityGeneration, nil)
 		}
 		return
 	}
-	s.registry.ApplyQuotaWindows(credentialID, providerQuotaWindows(response.Snapshot.QuotaWindows))
+	s.registry.ApplyQuotaWindows(credentialID, identityGeneration, providerQuotaWindows(response.Snapshot.QuotaWindows))
 }
 
 // providerQuotaWindows narrows the API-facing snapshot windows to the fields
@@ -801,7 +882,7 @@ func providerQuotaWindows(windows []ObservationQuotaWindow) []providerobservatio
 			Scope: window.Scope, Unit: window.Unit, SourceID: window.SourceID,
 			Used: window.Used, Limit: window.Limit, Remaining: window.Remaining, Utilization: window.Utilization,
 			ResetAtMS: window.ResetAtMS, WindowSeconds: window.WindowSeconds, ModelIDs: window.ModelIDs,
-			State: window.State, IsPrimary: window.IsPrimary,
+			State: window.State, IsPrimary: window.IsPrimary, ObservedAtMS: window.ObservedAtMS,
 		})
 	}
 	return result

@@ -64,6 +64,7 @@ var (
 	ErrCredentialReauthorizationRequired      = &APIError{HTTPStatus: http.StatusConflict, Code: "CREDENTIAL_REAUTHORIZATION_REQUIRED", Message: "Credential requires reauthorization"}
 	ErrCredentialAuthOutcomeUnknown           = &APIError{HTTPStatus: http.StatusConflict, Code: "CREDENTIAL_AUTH_OUTCOME_UNKNOWN", Message: "Credential authorization outcome is unknown"}
 	ErrCredentialVersionConflict              = &APIError{HTTPStatus: http.StatusConflict, Code: "CREDENTIAL_VERSION_CONFLICT", Message: "Credential changed since it was loaded"}
+	ErrMalformedPolicyStorage                 = &APIError{HTTPStatus: http.StatusInternalServerError, Code: "MALFORMED_POLICY_STORAGE", Message: "Stored policy configuration is malformed"}
 	ErrResetCreditUnavailable                 = &APIError{HTTPStatus: http.StatusConflict, Code: "RESET_CREDIT_UNAVAILABLE", Message: "No reset credit is currently available"}
 	ErrResetCreditPreparationFailed           = &APIError{HTTPStatus: http.StatusServiceUnavailable, Code: "RESET_CREDIT_PREPARATION_FAILED", Message: "Reset preparation failed; no reset credit was consumed. Please try again later"}
 	ErrResetCreditRejected                    = &APIError{HTTPStatus: http.StatusBadGateway, Code: "RESET_CREDIT_REJECTED", Message: "The reset credit was rejected by the upstream"}
