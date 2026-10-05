@@ -237,7 +237,9 @@ function decisionFormula(): string {
     .join(' · ')
   const multipliers = decision.receipt.price_multipliers
   const multiplier = multipliers ? ` × ${multipliers.group} × ${multipliers.access_key}` : ''
-  return `${quantities || '—'} · ${rates || '—'}${multiplier} = ${decisionCost(decision.estimated_cost_nano_usd)}`
+  const policyMultipliers =
+    decision.receipt.policy_factors?.map((f) => ` × ${f.factor}`).join('') || ''
+  return `${quantities || '—'} · ${rates || '—'}${multiplier}${policyMultipliers} = ${decisionCost(decision.estimated_cost_nano_usd)}`
 }
 
 function decisionConfidence(value: number): string {
@@ -851,6 +853,20 @@ function decisionRuleLabel(ruleID: string): string {
               }}
             </dd>
           </div>
+          <div v-if="!selfScoped && receipt?.policy_factors?.length" class="log-detail__wide">
+            <dt>{{ t('common.policyRules.applied') }}</dt>
+            <dd>
+              <span
+                v-for="(rule, rIdx) in receipt.policy_factors"
+                :key="rule.binding_scope + ':' + rule.rule_id"
+              >
+                {{ rIdx > 0 ? ' · ' : '' }}[{{ rule.binding_scope }}] {{ rule.name_snapshot }} ×{{
+                  rule.factor
+                }}
+                ({{ rule.rule_id }} · v{{ rule.revision }})
+              </span>
+            </dd>
+          </div>
           <div
             v-if="
               !selfScoped &&
@@ -871,6 +887,15 @@ function decisionRuleLabel(ruleID: string): string {
               <span v-if="log.auto_decision"
                 >{{ t('autoModel.decisionPriceItem') }} = {{ decisionFormula() }}</span
               >
+              <span
+                v-for="rule in log.auto_decision?.receipt?.policy_factors ?? []"
+                :key="'decision:' + rule.binding_scope + ':' + rule.rule_id"
+              >
+                {{ t('autoModel.decisionPriceItem') }} · [{{ rule.binding_scope }}]
+                {{ rule.name_snapshot }} ×{{ rule.factor }} ({{ rule.rule_id }} · v{{
+                  rule.revision
+                }})
+              </span>
               <template v-if="receipt && usageDisplayState === 'reported'">
                 <span>{{ t('monitor.logs.receipt.input') }} = {{ formula.input }}</span>
                 <span>{{ t('monitor.logs.receipt.output') }} = {{ formula.output }}</span>
@@ -879,7 +904,7 @@ function decisionRuleLabel(ruleID: string): string {
                 v-if="
                   receipt &&
                   usageDisplayState === 'reported' &&
-                  receipt.schema_version === 6 &&
+                  receipt.schema_version >= 6 &&
                   receipt.base_total_nano_usd !== undefined &&
                   receipt.price_multipliers
                 "
@@ -891,8 +916,8 @@ function decisionRuleLabel(ruleID: string): string {
                 <span>
                   {{ t('monitor.logs.receipt.finalTotal') }} =
                   {{ formatExactNanoUSD(receipt.base_total_nano_usd, locale) }} ×
-                  {{ receipt.price_multipliers.group }} ×
-                  {{ receipt.price_multipliers.access_key }} =
+                  {{ receipt.price_multipliers.group }} × {{ receipt.price_multipliers.access_key
+                  }}{{ receipt.policy_factors?.map((f) => ' × ' + f.factor).join('') || '' }} =
                   {{ formatExactNanoUSD(receipt.total_nano_usd, locale) }}
                 </span>
                 <small>{{ t('monitor.logs.receipt.totalRounding') }}</small>

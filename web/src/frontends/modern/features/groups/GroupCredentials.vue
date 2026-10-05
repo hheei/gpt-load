@@ -55,6 +55,7 @@ import { createOperationKey, useGroupCreateOperation } from './group-create-oper
 import APIKeyCredentialCard from './APIKeyCredentialCard.vue'
 import SubscriptionCredentialCard from './SubscriptionCredentialCard.vue'
 import CredentialDetailPanel from './CredentialDetailPanel.vue'
+import GroupPolicyPanel from './GroupPolicyPanel.vue'
 import CredentialTestDialog from './CredentialTestDialog.vue'
 import {
   AppButton,
@@ -126,13 +127,17 @@ const credentialView = useURLState(
   ['credential', 'credential_view'],
   (query) => ({
     id: positivePage(query.credential, 0),
-    mode: query.credential_view === 'test' ? 'test' : 'details',
+    mode: (query.credential_view === 'test'
+      ? 'test'
+      : query.credential_view === 'policy'
+        ? 'policy'
+        : 'details') as 'details' | 'test' | 'policy',
   }),
   (value) =>
     value.id
       ? {
           credential: String(value.id),
-          ...(value.mode === 'test' ? { credential_view: 'test' } : {}),
+          ...(value.mode !== 'details' ? { credential_view: value.mode } : {}),
         }
       : {},
 )
@@ -162,6 +167,20 @@ const testing = computed({
     credentialView.value = { id: row?.id ?? 0, mode: 'test' }
   },
 })
+const policyTarget = computed({
+  get: () =>
+    credentialView.value.id && credentialView.value.mode === 'policy'
+      ? credentialQuery.data.value
+      : undefined,
+  set: (row: { id?: number } | undefined) => {
+    credentialView.value = { id: row?.id ?? 0, mode: 'policy' }
+  },
+})
+function openCredentialPolicy(credentialID: number): void {
+  void router.replace({
+    query: { ...route.query, credential: String(credentialID), credential_view: 'policy' },
+  })
+}
 const resetTarget = ref<CredentialRow>()
 const resetKeys = new Map<number, string>()
 const cardErrors = ref(new Map<number, string>())
@@ -814,6 +833,10 @@ async function action(row: CredentialRow, value: string): Promise<void> {
     detail.value = row
     return
   }
+  if (value === 'policy') {
+    openCredentialPolicy(row.id)
+    return
+  }
   if (value === 'test') {
     testing.value = row
     return
@@ -1313,6 +1336,15 @@ defineExpose({ refresh })
     :channel="channel"
     @close="detail = undefined"
     @saved="saved"
+    @policy="openCredentialPolicy(credentialView.id)"
+  />
+  <GroupPolicyPanel
+    v-if="policyTarget"
+    :key="policyTarget.id"
+    :group="group"
+    :credential="policyTarget"
+    @close="policyTarget = undefined"
+    @saved="emit('changed')"
   />
   <CredentialTestDialog
     v-if="testing"
